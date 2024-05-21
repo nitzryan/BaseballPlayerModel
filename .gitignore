@@ -4,4 +4,5 @@ __pycache__
 *.db
 text.txt
 names.txt
+mlbNames.txt
 ErrorMsgs/

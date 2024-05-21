@@ -15,27 +15,15 @@ import traceback
 import YearlyFielding
 
 from unidecode import unidecode
-def LogPlayer(driver, db, file, name, playerId, isHitter):
-    name = str.replace(name, " ", "-").lower()
-    name = str.replace(name, "'", "-")
-    name = str.replace(name, ".", "-")
-    name = str.replace(name, "--", "-")
-    name = unidecode(name)
+def LogPlayer(driver, db, file, playerId):
+    # name = str.replace(name, " ", "-").lower()
+    # name = str.replace(name, "'", "-")
+    # name = str.replace(name, ".", "-")
+    # name = str.replace(name, "--", "-")
+    # name = unidecode(name)
     
     cursor = db.cursor()
     thisPlayerId = cursor.execute("SELECT id FROM Player WHERE mlbId=" + str(playerId)).fetchone()
-    
-    if (isHitter):
-        if (thisPlayerId is not None and len(thisPlayerId) == 1):
-            cursor = db.cursor()
-            if cursor.execute("SELECT COUNT(*) FROM PlayerYearHitter WHERE playerId=" + str(thisPlayerId[0])).fetchone()[0] > 0:
-                return
-        
-    else:
-        if (thisPlayerId is not None and len(thisPlayerId) == 1):
-            cursor = db.cursor()
-            if cursor.execute("SELECT COUNT(*) FROM PlayerYearPitcher WHERE playerId=" + str(thisPlayerId[0])).fetchone()[0] > 0:
-                return
     
     # Check if entry for player exists
     cursor = db.cursor()
@@ -49,7 +37,7 @@ def LogPlayer(driver, db, file, name, playerId, isHitter):
                 EC.presence_of_element_located((By.CLASS_NAME, "player-header--vitals"))
             )
         except:
-            file.write(f"Failed to find {name}\n")
+            file.write(f"Failed to find {id}\n")
             #LogPlayer(driver, db, name, playerId, isHitter)
             return
         
@@ -106,7 +94,7 @@ def LogPlayer(driver, db, file, name, playerId, isHitter):
     cursor = db.cursor()
     position = cursor.execute("SELECT position FROM Player WHERE mlbId=" + str(playerId)).fetchone()[0]
     # Update isHitter to match if they are a hitter or a pitcher, not whether they had hitting or pitching stats
-    isHitter = not "P" in position
+    isHitter = not "P" in position or position == "PH"
     
     # Get playerID in this database
     cursor = db.cursor()
@@ -270,32 +258,78 @@ def GetPlayers(file, driver, league, year, isHitter):
             name = str.replace(name, "  ", " ")
             file.write(hitterPitcherSymbol + name + ":" + str(mlbId)+"\n")
         
+def GetMLBPlayers(file, driver, year, isHitter):
+    page = "https://mlb.com/stats"
+    if not isHitter:
+        page += "/pitching"
+    
+    page += f"/{year}"
+    page += "?playerPool=ALL"
+    
+    #driver.get(page)
+    GetUrl.GetUrl(driver, page)
+    #print(page)
+    
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.TAG_NAME, "body"))
+    )
+    
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, "/html/body/main/div[2]/section/section/div[3]/div[2]/div/div/div[1]"))
+            )
+    except: # No elements on this page
+        raise Exception("No Players Found")
+        
+    
+    navigationButtons = driver.find_element(By.XPATH, "/html/body/main/div[2]/section/section/div[3]/div[2]/div/div/div[1]")
+    buttons = navigationButtons.find_elements(By.TAG_NAME, "div")
+    numPages = int(buttons[-1].get_attribute("textContent").strip())
+    
+    for currentPage in range(1, numPages + 1):
+        if currentPage != 1:
+            GetUrl.GetUrl(driver, page + "&page=" + str(currentPage))
+            #driver.get(page + "?page=" + str(currentPage))
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "bui-link"))
+            )
+        
+        time.sleep(3)
+        links = []
+        while len(links) == 0:
+            links = driver.find_elements(By.XPATH, "/html/body/main/div[2]/section/section/div[3]/div[1]/div/table/tbody/tr/th/div[1]/div[2]/div/div[1]/a")
+            
+        for link in links:
+            mlbId = int(link.get_attribute("href").split("/")[4])
+            file.write(str(mlbId)+"\n")
                 
 def ReadNameFile(drivers, file):
     playerData = []
     for line in file:
-        data = (line.split(",")[1], int(line.split(",")[2]), line.split(",")[0] == "H")
-        playerData.append(data)
+        #data = (line.split(",")[1], int(line.split(",")[2]), line.split(",")[0] == "H")
+        #playerData.append(data)
+        playerData.append(int(line))
     
-    sortedData = sorted(playerData, key=lambda x: x[1])
-    numDrivers = len(drivers)
-    playerFileLength = len(sortedData)
+    playerData = list(set(playerData))
+    sortedData = sorted(playerData, key=lambda x: x)
     
-    def LogPartOfList(driver, data, stIdx, endIdx, threadIdx):
+    def LogPartOfList(driver, getIdFunction, threadIdx):
         db = sqlite3.connect("playerData.db")
         db.execute("PRAGMA journal_mode = WAL")
         db.commit()
         
-        numEntries = endIdx - stIdx
-        n = 0
+        thisDone = 0
+        totalDone = 0
         
         file = open(f"Errors{threadIdx}.txt", "w")
         done = False
         
         def PrintNumCompleted():
-            print(f"Thread {threadIdx} has completed {n}/{numEntries} Entries")
+            nonlocal thisDone
+            print(f"Thread {threadIdx} has completed {thisDone} Entries this cycle, {totalDone} in total")
+            thisDone = 0
             if not done:
-                threading.Timer(60, PrintNumCompleted).start()  
+                threading.Timer(60, PrintNumCompleted).start() 
         
         PrintNumCompleted()
         
@@ -303,38 +337,59 @@ def ReadNameFile(drivers, file):
             print(f"Timed Out on thread {threadIdx}")
             raise GetUrl.Timeout()
         
-        for i in range(stIdx, endIdx):
+        while True:
             timer = threading.Timer(60, TimeoutHandler)
             timer.start()
             try:
-                LogPlayer(driver, db, file, data[i][0], data[i][1], data[i][2])
+                id = getIdFunction()
+                if id == -1:
+                    timer.cancel()
+                    break
+                
+                LogPlayer(driver, db, file, id)
+                thisDone += 1
+                totalDone += 1
                 timer.cancel()
             except KeyboardInterrupt:
                 timer.cancel()
                 print("Hello")
                 raise KeyboardInterrupt
             except GetUrl.Timeout:
-                file.write(f"Timed Out for {data[i][0]}")
+                file.write(f"Timed Out for {id}\n")
                 print(f"Timed Out on thread {threadIdx}")
                 timer.cancel()
             except:
-                file.write(f"Uncaught Exception for {data[i][0]}")
+                file.write(f"Uncaught Exception for {id}\n")
                 print(f"Uncaught Exception {threadIdx}")
                 timer.cancel()
-            n += 1
 
         file.close()
         print(f"Thread {threadIdx} has completed")
         done = True
     
     threads = []
+    lock = threading.Lock()
+    def GetNextId():
+        with lock:
+            if len(sortedData) > 0:
+                return sortedData.pop(0)
+            else:
+                return -1
+    
+    def LeftTimer():
+        print(f"Number of Players Left: {len(sortedData)}")
+        if len(sortedData) != 0:
+            threading.Timer(60, LeftTimer).start()
+            
+    offsetTime = 0.25 # Makes messages appear in order
+    LeftTimer()
+    time.sleep(offsetTime)
     
     for d in range(len(drivers)):
-        startIdx = d * playerFileLength // numDrivers
-        endIdx = (d + 1) * playerFileLength // numDrivers
-        thread = threading.Thread(target=LogPartOfList, args=[drivers[d], sortedData, startIdx, endIdx, d])
+        thread = threading.Thread(target=LogPartOfList, args=[drivers[d], GetNextId, d])
         threads.append(thread)
         thread.start()
+        time.sleep(offsetTime)
     
     
     for thread in threads:
@@ -529,7 +584,7 @@ def GenerateFielding(drivers):
 
 options = webdriver.ChromeOptions() 
 options.add_argument("--log-level=3")
-#options.add_argument('--headless=new')
+options.add_argument('--headless=new')
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 options.add_argument("--disable-renderer-backgrounding")
@@ -581,18 +636,28 @@ for i in range(1):
 # ReadGameLogs(driver, db, 1)
 # ReadGameLogs(driver, db, 4)
 
-# file = open("names.txt", "r", encoding="utf-8")
+# file = open("mlbNames.txt", "r", encoding="utf-8")
 # ReadNameFile(drivers, file)
 
 #GenerateFielding(drivers)
 
 db = sqlite3.connect("playerData.db")
-file = open("testFile.txt", "w")
-YearlyFielding.ReadPlayerFielding(drivers[0], db, file, 15455, 467090, True)
-YearlyFielding.ReadPlayerFielding(drivers[0], db, file, 16492, 673661, False)
-YearlyFielding.ReadPlayerFielding(drivers[0], db, file, 17442, 440162, False)
-YearlyFielding.ReadPlayerFielding(drivers[0], db, file, 39130, 680646, False)
+# file = open("mlbNames.txt", "w")
+# YearlyFielding.ReadPlayerFielding(drivers[0], db, file, 15455, 467090, True)
+# YearlyFielding.ReadPlayerFielding(drivers[0], db, file, 16492, 673661, False)
+# YearlyFielding.ReadPlayerFielding(drivers[0], db, file, 17442, 440162, False)
+# YearlyFielding.ReadPlayerFielding(drivers[0], db, file, 39130, 680646, False)
+
+ids = [673540,673490,807799]
+file = open("text.txt", "w", encoding='utf-8')
+for id in ids:
+    LogPlayer(drivers[0], db, file, id)
+
+# for year in range(2021, 2024):
+#     file.write(f"Year: {year}\n")
+#     GetMLBPlayers(file, drivers[0], year, True)
+#     GetMLBPlayers(file, drivers[0], year, False)
 
 for driver in drivers:
     driver.quit()
-file.close()
+# file.close()
